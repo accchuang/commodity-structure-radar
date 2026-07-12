@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Project data (large binary files)
+data/raw/
+data/bias/
+data/price/
+data/alerts*.json
+data/alerts*.jsonl
+
+# TqSdk
+.tqsdk/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Temp/test scripts
+_test_*.py
+test_structural.py
+fetch_all_prices.py
