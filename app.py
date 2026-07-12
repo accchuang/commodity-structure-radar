@@ -42,6 +42,8 @@ from src.structural_analysis import (
     calc_structure_score,
     calc_all_symbols_scores,
     detect_structure_alerts,
+    get_broker_scatter_data,
+    compute_structure_alerts_for_all,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -569,6 +571,44 @@ def render_structure_heatmap():
             row["摘要"] = s.get("summary", "")
             rows.append(row)
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    # ═══ Structure Alerts ═══
+    # Compute alerts by comparing latest vs previous day
+    alert_data = _compute_heatmap_alerts()
+    if alert_data:
+        st.divider()
+        st.caption("**🚨 结构预警**")
+        alert_cols = st.columns(min(len(alert_data), 3))
+        for i, alert in enumerate(alert_data[:6]):
+            with alert_cols[i % 3]:
+                sev_color = {"high": "#FF1744", "medium": "#FFA726"}
+                sev_icon = {"high": "🔴", "medium": "🟡"}
+                with st.container(border=True):
+                    st.markdown(
+                        f"<span style='color:{sev_color.get(alert.get('severity', ''), '#888')}'>"
+                        f"{sev_icon.get(alert.get('severity', ''), '')} "
+                        f"**{alert['symbol'].upper()}**</span>",
+                        unsafe_allow_html=True,
+                    )
+                    st.caption(alert.get("detail", ""))
+
+
+@st.cache_data(ttl=600)
+def _compute_heatmap_alerts():
+    """Compute structure alerts for the heatmap. Cached 10 min."""
+    from src.config import STRUCTURE_LOOKBACK_DAYS
+    historical = {}
+    broker_ts_all = {}
+    defections_all = {}
+    for sym in MONITORED_SYMBOLS:
+        hist = load_historical_positions(sym, lookback_days=STRUCTURE_LOOKBACK_DAYS)
+        if not hist or len(hist) < 2:
+            continue
+        historical[sym] = hist
+        bts = calc_broker_momentum_timeseries(hist, top_n=5)
+        broker_ts_all[sym] = bts
+        defections_all[sym] = detect_broker_defections(bts)
+    return compute_structure_alerts_for_all(historical, broker_ts_all, defections_all)
 
 
 def _render_panorama(symbol: str):
@@ -1498,6 +1538,11 @@ def _render_smart_money(corr_df, smart_money: dict, symbol: str):
     contrarian = smart_money.get("contrarian", [])
     noisy = smart_money.get("noisy", [])
 
+    # Load raw data for scatter plots
+    hist = load_historical_positions(symbol, lookback_days=STRUCTURE_LOOKBACK_DAYS)
+    broker_ts = calc_broker_momentum_timeseries(hist, top_n=5) if hist else {}
+    price_df = load_price_data(symbol)
+
     # ── Summary metrics ──
     sum_cols = st.columns(4)
     with sum_cols[0]:
@@ -1514,21 +1559,27 @@ def _render_smart_money(corr_df, smart_money: dict, symbol: str):
         st.metric("信号比例", f"{signal_pct:.0%}")
 
     # ── Leaderboard tabs ──
-    lead_tab, contrarian_tab, full_tab = st.tabs([
-        "🟢 领先多头席位", "🔴 反向/空头席位", "📋 全量排名",
+    lead_tab, contrarian_tab, full_tab, scatter_tab = st.tabs([
+        "🟢 领先多头", "🔴 反向指标", "📋 全量排名", "📈 散点验证",
     ])
 
     with lead_tab:
         if leading_long:
-            _render_corr_leaderboard(leading_long, "long")
+            _render_corr_leaderboard(leading_long, "long", broker_ts, price_df, symbol)
         else:
             st.info("未检测到领先多头席位（ΔNP 与未来涨幅正相关）。")
 
     with contrarian_tab:
         if contrarian:
-            _render_corr_leaderboard(contrarian, "short")
+            _render_corr_leaderboard(contrarian, "short", broker_ts, price_df, symbol)
         else:
             st.info("未检测到反向指标席位（ΔNP 与未来涨幅负相关）。")
+
+    with scatter_tab:
+        if broker_ts and price_df is not None and not price_df.empty:
+            _render_scatter_grid(corr_df, broker_ts, price_df, symbol)
+        else:
+            st.info("需要价格数据和席位动量数据来生成散点图。")
 
     with full_tab:
         st.caption("**全量相关性排名**（按 |Pearson r| 降序）")
@@ -1550,8 +1601,9 @@ def _render_smart_money(corr_df, smart_money: dict, symbol: str):
         )
 
 
-def _render_corr_leaderboard(brokers: list[dict], direction: str):
-    """Render a single correlation leaderboard."""
+def _render_corr_leaderboard(brokers: list[dict], direction: str,
+                             broker_ts=None, price_df=None, symbol: str = ""):
+    """Render a single correlation leaderboard with scatter plot expanders."""
     import plotly.graph_objects as go
 
     if not brokers:
@@ -1600,6 +1652,138 @@ def _render_corr_leaderboard(brokers: list[dict], direction: str):
                 f"Spearman ρ = {broker_info['spearman_r']:.3f}  |  "
                 f"平均影响 = {broker_info['avg_impact']:.4%}"
             )
+            # Scatter plot expander
+            if broker_ts and price_df is not None and not price_df.empty:
+                with st.expander(f"📈 {broker_info['broker']} ΔNP vs 收益 散点图", expanded=False):
+                    scatter_df = get_broker_scatter_data(
+                        broker_info["broker"], broker_ts, price_df,
+                        lag=int(broker_info["lag"]),
+                    )
+                    if scatter_df is not None and len(scatter_df) >= 3:
+                        _render_broker_scatter(scatter_df, broker_info)
+                    else:
+                        st.caption("数据不足，无法绘图")
+
+
+def _render_broker_scatter(scatter_df, broker_info: dict):
+    """Render a single broker's ΔNP vs future return scatter plot."""
+    import plotly.graph_objects as go
+    import numpy as np
+
+    x = scatter_df["delta_np"].values
+    y = scatter_df["future_return"].values
+
+    # Regression line
+    slope, intercept = np.polyfit(x, y, 1)
+    x_line = np.linspace(x.min(), x.max(), 50)
+    y_line = slope * x_line + intercept
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=x, y=y, mode="markers",
+        marker=dict(
+            size=10, color="#42A5F5", opacity=0.7,
+            line=dict(width=1, color="white"),
+        ),
+        name="观测值",
+        hovertemplate=(
+            "<b>ΔNP</b>: %{x:+}<br>"
+            "<b>未来收益</b>: %{y:.2%}<br>"
+            "<extra></extra>"
+        ),
+    ))
+    fig.add_trace(go.Scatter(
+        x=x_line, y=y_line, mode="lines",
+        line=dict(color="#FF1744", width=1.5, dash="dash"),
+        name=f"回归线 (r={broker_info['pearson_r']:.3f})",
+    ))
+    fig.add_hline(y=0, line_dash="dot", line_color="#888", opacity=0.5)
+
+    fig.update_layout(
+        template="plotly_dark", height=250,
+        margin=dict(l=10, r=10, t=20, b=10),
+        paper_bgcolor="#1E1E1E", plot_bgcolor="#1E1E1E",
+        font=dict(color="#CCCCCC", size=10),
+        xaxis=dict(gridcolor="#333333", title="ΔNP（净持仓变动）"),
+        yaxis=dict(gridcolor="#333333", title="未来收益", tickformat=".1%"),
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, font=dict(size=9)),
+    )
+    st.plotly_chart(fig, use_container_width=True,
+                    key=f"scatter_{broker_info['broker']}")
+
+
+def _render_scatter_grid(corr_df, broker_ts, price_df, symbol: str):
+    """Render a grid of small scatter plots for top brokers."""
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    import numpy as np
+
+    top_brokers = corr_df.head(6)
+    if top_brokers.empty:
+        st.info("无相关性数据。")
+        return
+
+    n = len(top_brokers)
+    cols = min(3, n)
+    rows = (n + cols - 1) // cols
+
+    fig = make_subplots(
+        rows=rows, cols=cols,
+        subplot_titles=[
+            f"{row['broker']} (r={row['pearson_r']:.3f}, lag={int(row['lag'])})"
+            for _, row in top_brokers.iterrows()
+        ],
+        horizontal_spacing=0.08, vertical_spacing=0.12,
+    )
+
+    for i, (_, broker_row) in enumerate(top_brokers.iterrows()):
+        r_idx = i // cols + 1
+        c_idx = i % cols + 1
+
+        scatter_df = get_broker_scatter_data(
+            broker_row["broker"], broker_ts, price_df,
+            lag=int(broker_row["lag"]),
+        )
+        if scatter_df is None or len(scatter_df) < 3:
+            continue
+
+        x = scatter_df["delta_np"].values
+        y = scatter_df["future_return"].values
+        slope, intercept = np.polyfit(x, y, 1)
+        x_line = np.linspace(x.min(), x.max(), 30)
+
+        fig.add_trace(
+            go.Scatter(
+                x=x, y=y, mode="markers",
+                marker=dict(size=6, color="#42A5F5", opacity=0.6),
+                showlegend=False,
+                hovertemplate="ΔNP: %{x:+}<br>收益: %{y:.2%}<extra></extra>",
+            ),
+            row=r_idx, col=c_idx,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=x_line, y=slope * x_line + intercept,
+                mode="lines", line=dict(color="#FF1744", width=1, dash="dash"),
+                showlegend=False,
+            ),
+            row=r_idx, col=c_idx,
+        )
+        fig.add_hline(y=0, line_dash="dot", line_color="#888", opacity=0.4,
+                      row=r_idx, col=c_idx)
+
+    fig.update_layout(
+        template="plotly_dark",
+        height=rows * 220 + 40,
+        margin=dict(l=10, r=10, t=30, b=10),
+        paper_bgcolor="#1E1E1E", plot_bgcolor="#1E1E1E",
+        font=dict(color="#CCCCCC", size=9),
+    )
+    fig.update_xaxes(gridcolor="#333333")
+    fig.update_yaxes(gridcolor="#333333", tickformat=".1%")
+
+    st.plotly_chart(fig, use_container_width=True, key="scatter_grid")
 
 
 # ═══════════════════════════════════════════════════════════════════

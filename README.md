@@ -115,6 +115,12 @@ commodity-structure-radar/
 
 ---
 
+## Documentation
+
+📖 **[指标说明与使用手册](docs/indicators-guide.md)** — 所有面板的详细原理解释、指标公式、使用方法和实战场景。
+
+---
+
 ## Configuration
 
 All tunable parameters are in `src/config.py`:

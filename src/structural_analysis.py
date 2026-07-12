@@ -1648,3 +1648,128 @@ def detect_structure_alerts(
                            "detail": f"{symbol.upper()} {cn}触底({c['score']}/{c['max']})。{c['detail']}"})
 
     return alerts
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 15. Broker Scatter Data — for smart-money visualization
+# ═══════════════════════════════════════════════════════════════════
+
+def get_broker_scatter_data(
+    broker: str,
+    broker_ts: dict[str, pd.DataFrame],
+    price_df: pd.DataFrame,
+    lag: int = 1,
+) -> Optional[pd.DataFrame]:
+    """
+    Extract (ΔNP, future_return) pairs for a single broker at a given lag.
+
+    Used to draw scatter plots in the smart-money dashboard tab.
+
+    Parameters
+    ----------
+    broker : str
+        Broker name.
+    broker_ts : dict[str, pd.DataFrame]
+        Output of calc_broker_momentum_timeseries().
+    price_df : pd.DataFrame
+        Daily price data with 'date' and 'close' columns.
+    lag : int
+        Forward-return lag in days.
+
+    Returns
+    -------
+    pd.DataFrame or None
+        Columns: [date, delta_np, net_pos, close, future_return].
+        None if insufficient data.
+    """
+    if broker not in broker_ts:
+        return None
+
+    df = broker_ts[broker].sort_values("date").reset_index(drop=True)
+    df["date_dt"] = pd.to_datetime(df["date"], errors="coerce")
+
+    price = price_df.copy()
+    if "date" in price.columns:
+        price["date"] = pd.to_datetime(price["date"], errors="coerce")
+    price = price.sort_values("date").reset_index(drop=True)
+
+    merged = pd.merge(
+        df[["date_dt", "delta_np", "net_pos"]],
+        price[["date", "close"]],
+        left_on="date_dt", right_on="date", how="inner",
+    )
+
+    if len(merged) < 3:
+        return None
+
+    merged["future_return"] = (
+        merged["close"].shift(-lag) / merged["close"] - 1
+    )
+    merged = merged.dropna(subset=["delta_np", "future_return"])
+
+    if len(merged) < 3:
+        return None
+
+    return merged[["date", "delta_np", "net_pos", "close", "future_return"]].reset_index(drop=True)
+
+
+def compute_structure_alerts_for_all(
+    historical_by_symbol: dict,
+    broker_ts_by_symbol: dict,
+    defections_by_symbol: dict,
+) -> list[dict]:
+    """
+    Compute structure alerts for all symbols by comparing latest vs previous day.
+
+    Returns list of alert dicts, sorted by severity then symbol.
+    """
+    all_alerts = []
+    for symbol in historical_by_symbol:
+        hist = historical_by_symbol.get(symbol, {})
+        if not hist or len(hist) < 2:
+            continue
+
+        # Latest score (all data)
+        cr_df = calc_cr_timeseries(hist)
+        cr_df_t = calc_cr_trend(cr_df)
+        turnover_df = calc_turnover_ratio(hist)
+        entrants_df = detect_new_entrants(hist)
+        div_df = calc_divergence_index(cr_df)
+        defs = defections_by_symbol.get(symbol, [])
+        stb = calc_rank_stability(cr_df)
+
+        latest_score = calc_structure_score(
+            cr_trend_df=cr_df_t, turnover_df=turnover_df,
+            entrants_df=entrants_df, divergence_df=div_df,
+            defections=defs, stability_df=stb, symbol=symbol,
+        )
+
+        # Previous score (exclude latest day)
+        dates = sorted(hist.keys())
+        if len(dates) >= 2:
+            prev_hist = {d: hist[d] for d in dates[:-1]}
+            prev_cr = calc_cr_timeseries(prev_hist)
+            prev_cr_t = calc_cr_trend(prev_cr)
+            prev_tov = calc_turnover_ratio(prev_hist)
+            prev_ent = detect_new_entrants(prev_hist)
+            prev_div = calc_divergence_index(prev_cr)
+            prev_stb = calc_rank_stability(prev_cr)
+            # Filter defections to previous day range
+            prev_dates = sorted(prev_hist.keys())
+            prev_defs = [d for d in defs if d.get("date", "") <= prev_dates[-1]] if prev_dates else defs
+
+            prev_score = calc_structure_score(
+                cr_trend_df=prev_cr_t, turnover_df=prev_tov,
+                entrants_df=prev_ent, divergence_df=prev_div,
+                defections=prev_defs, stability_df=prev_stb, symbol=symbol,
+            )
+        else:
+            prev_score = None
+
+        alerts = detect_structure_alerts(latest_score, prev_score)
+        all_alerts.extend(alerts)
+
+    # Sort: high severity first, then by type priority
+    sev_order = {"high": 0, "medium": 1}
+    all_alerts.sort(key=lambda a: (sev_order.get(a.get("severity", "low"), 9), a["symbol"]))
+    return all_alerts
