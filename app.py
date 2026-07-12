@@ -44,7 +44,13 @@ from src.structural_analysis import (
     detect_structure_alerts,
     get_broker_scatter_data,
     compute_structure_alerts_for_all,
+    save_daily_scores,
+    load_score_history,
+    compute_score_timeseries,
+    calc_sector_health,
+    generate_daily_brief,
 )
+from src.config import SECTOR_DEFINITIONS
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -611,6 +617,188 @@ def _compute_heatmap_alerts():
     return compute_structure_alerts_for_all(historical, broker_ts_all, defections_all)
 
 
+@st.cache_data(ttl=600)
+def _load_sector_health():
+    """Compute sector health for all symbols. Cached 10 min."""
+    scores = _load_all_symbols_scores()
+    if not scores:
+        return None, scores
+    return calc_sector_health(scores), scores
+
+
+@st.cache_data(ttl=600)
+def _load_score_history():
+    """Load score history from file. Cached 10 min."""
+    return load_score_history()
+
+
+def render_sector_health():
+    """Render sector-level structure health overview."""
+    sector_health, scores = _load_sector_health()
+
+    if sector_health is None:
+        st.info("至少需要 2 天数据。")
+        return
+
+    import plotly.graph_objects as go
+
+    # ── Sector summary bar ──
+    sectors = sorted(sector_health.items(),
+                     key=lambda x: x[1]["non_healthy_ratio"], reverse=True)
+
+    scols = st.columns(len(sectors) + 1)
+    alert_sectors = [s for s, si in sectors if si["alert"]]
+    with scols[0]:
+        st.metric("板块总数", len(sectors),
+                  delta=f"⚠ {len(alert_sectors)} 预警" if alert_sectors else "✓ 全部正常",
+                  delta_color="off")
+
+    for i, (sname, sinfo) in enumerate(sectors):
+        with scols[i + 1]:
+            alert_tag = "⚠" if sinfo["alert"] else "✓"
+            st.metric(
+                f"{alert_tag} {sname}",
+                f"{sinfo['avg_score']:.0f}分",
+                delta=f"健康 {sinfo['healthy']}/{sinfo['total']}",
+                delta_color="off",
+            )
+
+    # ── Sector health stacked bar ──
+    st.divider()
+    fig = go.Figure()
+
+    statuses = ["healthy", "caution", "unstable", "critical"]
+    colors_map = {"healthy": "#00E676", "caution": "#FFEB3B",
+                  "unstable": "#FFA726", "critical": "#FF1744"}
+    names_cn = {"healthy": "健康", "caution": "关注",
+                "unstable": "松动", "critical": "危险"}
+
+    for status_name in statuses:
+        vals = []
+        labels = []
+        for sname, sinfo in sectors:
+            vals.append(sinfo[status_name])
+            labels.append(sname)
+        fig.add_trace(go.Bar(
+            y=labels, x=vals,
+            name=names_cn[status_name],
+            orientation="h",
+            marker=dict(color=colors_map[status_name]),
+            hovertemplate=f"{names_cn[status_name]}: %{{x}}<extra></extra>",
+        ))
+
+    fig.update_layout(
+        barmode="stack",
+        template="plotly_dark",
+        height=max(200, len(sectors) * 42 + 40),
+        margin=dict(l=10, r=10, t=10, b=10),
+        paper_bgcolor="#1E1E1E", plot_bgcolor="#1E1E1E",
+        font=dict(color="#CCCCCC", size=11),
+        xaxis=dict(gridcolor="#333333", title="品种数"),
+        yaxis=dict(gridcolor="#333333", autorange="reversed"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, font=dict(size=9)),
+    )
+    st.plotly_chart(fig, use_container_width=True, key="sector_bar")
+
+    # ── Alert sector details ──
+    if alert_sectors:
+        st.divider()
+        st.warning(f"⚠ **{len(alert_sectors)} 个板块** 超过 {SECTOR_DEFINITIONS.get(list(SECTOR_DEFINITIONS.keys())[0], {}).get('symbols', []) and '60'}% 品种结构异常")
+        for sname, sinfo in sectors:
+            if sinfo["alert"]:
+                with st.expander(f"⚠ {sname} — {sinfo['description']}", expanded=True):
+                    for sd in sinfo["symbols_detail"]:
+                        emoji = {"healthy": "🟢", "caution": "🟡",
+                                 "unstable": "🟠", "critical": "🔴"}.get(sd["status"], "")
+                        st.caption(f"{emoji} **{sd['symbol']}** — {sd['score']}/100 | {sd['summary']}")
+
+
+def render_score_trend():
+    """Render score history trend for selected symbol."""
+    symbol = st.session_state.selected_symbol
+
+    # Compute score for each available date
+    hist = load_historical_positions(symbol, lookback_days=STRUCTURE_LOOKBACK_DAYS)
+    if not hist or len(hist) < 3:
+        st.info("需要至少 3 天数据才能绘制评分趋势。")
+        return
+
+    score_df = compute_score_timeseries({symbol: hist})
+    if score_df is None or score_df.empty:
+        st.info("评分趋势数据不足。")
+        return
+
+    import plotly.graph_objects as go
+
+    fig = go.Figure()
+
+    # Status zone background
+    fig.add_hrect(y0=80, y1=105, fillcolor="rgba(0,230,118,0.08)", layer="below",
+                  annotation_text="健康", annotation_position="right")
+    fig.add_hrect(y0=60, y1=80, fillcolor="rgba(255,235,59,0.08)", layer="below",
+                  annotation_text="关注", annotation_position="right")
+    fig.add_hrect(y0=40, y1=60, fillcolor="rgba(255,167,38,0.08)", layer="below",
+                  annotation_text="松动", annotation_position="right")
+    fig.add_hrect(y0=0, y1=40, fillcolor="rgba(255,23,68,0.08)", layer="below",
+                  annotation_text="危险", annotation_position="right")
+
+    # Score line
+    status_colors = {"healthy": "#00E676", "caution": "#FFEB3B",
+                     "unstable": "#FFA726", "critical": "#FF1744"}
+
+    fig.add_trace(go.Scatter(
+        x=score_df["date"], y=score_df["score"],
+        mode="lines+markers",
+        line=dict(color="#42A5F5", width=2.5),
+        marker=dict(
+            size=10,
+            color=[status_colors.get(s, "#888") for s in score_df["status"]],
+            line=dict(width=1, color="white"),
+        ),
+        text=[f"{s}分 ({st})" for s, st in zip(score_df["score"], score_df["status"])],
+        hovertemplate="<b>%{x}</b><br>评分: <b>%{text}</b><extra></extra>",
+    ))
+
+    # Score change arrows
+    if len(score_df) >= 2:
+        prev_score = score_df["score"].iloc[-2]
+        curr_score = score_df["score"].iloc[-1]
+        change = curr_score - prev_score
+        arrow = "▲" if change > 0 else "▼" if change < 0 else "—"
+        arrow_color = "#00E676" if change > 0 else "#FF1744" if change < 0 else "#888"
+        fig.add_annotation(
+            x=score_df["date"].iloc[-1], y=curr_score,
+            text=f"<span style='color:{arrow_color}'>{arrow}{abs(change)}</span>",
+            showarrow=False, yshift=20, font=dict(size=13),
+        )
+
+    fig.update_layout(
+        template="plotly_dark", height=320,
+        margin=dict(l=10, r=20, t=20, b=10),
+        paper_bgcolor="#1E1E1E", plot_bgcolor="#1E1E1E",
+        font=dict(color="#CCCCCC", size=11),
+        xaxis=dict(gridcolor="#333333", title=None),
+        yaxis=dict(gridcolor="#333333", title="结构健康度", range=[0, 105]),
+        hovermode="x unified",
+    )
+    st.plotly_chart(fig, use_container_width=True, key="score_trend")
+
+    # Save scores button
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        st.caption(
+            f"最新: **{score_df['score'].iloc[-1]}分** "
+            f"({score_df['status'].iloc[-1]}) | "
+            f"最早: {score_df['date'].min().date()} → {score_df['date'].max().date()}"
+        )
+    with col2:
+        scores = _load_all_symbols_scores()
+        if st.button("💾 保存今日评分", use_container_width=True, key="save_scores"):
+            path = save_daily_scores(scores)
+            _load_score_history.clear()
+            st.success(f"已保存 → {path}")
+
+
 def _render_panorama(symbol: str):
     """Render P2+P3 microstructure panorama with composite score."""
     turnover_df, entrants_df, divergence_df, profile_df = _load_p2_data(symbol)
@@ -958,13 +1146,16 @@ def render_structure_evolution():
     # ── CR Time Series Chart ──
     broker_ts, defections, corr_df, smart_money = _load_p1_data(symbol)
 
-    chart_tab, panorama_tab, events_tab, broker_tab, defection_tab, smart_tab = st.tabs([
-        "📈 CR 趋势图", "📊 全景", "🚨 结构事件", "🔍 席位排名变动",
-        "🚨 席位叛变", "💰 聪明钱",
+    chart_tab, trend_tab, panorama_tab, events_tab, broker_tab, defection_tab, smart_tab = st.tabs([
+        "📈 CR 趋势图", "📉 评分趋势", "📊 全景", "🚨 结构事件",
+        "🔍 席位排名变动", "🚨 席位叛变", "💰 聪明钱",
     ])
 
     with chart_tab:
         _render_cr_chart(cr_df)
+
+    with trend_tab:
+        render_score_trend()
 
     with panorama_tab:
         _render_panorama(symbol)
@@ -1786,6 +1977,51 @@ def _render_scatter_grid(corr_df, broker_ts, price_df, symbol: str):
     st.plotly_chart(fig, use_container_width=True, key="scatter_grid")
 
 
+def _render_daily_brief():
+    """Render daily brief generation panel."""
+    st.caption("**生成每日结构简报** — Markdown 格式，包含预警品种、板块总览、叛变事件")
+
+    if st.button("📝 生成今日简报", use_container_width=True):
+        scores = _load_all_symbols_scores()
+        if not scores:
+            st.error("数据不足，无法生成简报。")
+            return
+
+        sector_health, _ = _load_sector_health()
+
+        # Get today's defections
+        from src.config import STRUCTURE_LOOKBACK_DAYS
+        defections_by_symbol = {}
+        for sym in MONITORED_SYMBOLS:
+            hist = load_historical_positions(sym, lookback_days=STRUCTURE_LOOKBACK_DAYS)
+            if not hist or len(hist) < 2:
+                continue
+            bts = calc_broker_momentum_timeseries(hist, top_n=5)
+            defections_by_symbol[sym] = detect_broker_defections(bts)
+
+        alerts = _compute_heatmap_alerts()
+
+        brief = generate_daily_brief(
+            scores, sector_health or {},
+            defections_by_symbol=defections_by_symbol,
+            alerts=alerts,
+        )
+
+        st.success("简报已生成！")
+        st.markdown(brief[:3000] + ("\n\n...(截断，完整内容已保存到 data/briefs/)" if len(brief) > 3000 else ""))
+
+    # Show previous briefs
+    from src.config import BRIEF_OUTPUT_DIR
+    import os as _os
+    if _os.path.isdir(BRIEF_OUTPUT_DIR):
+        briefs = sorted([f for f in _os.listdir(BRIEF_OUTPUT_DIR) if f.endswith(".md")], reverse=True)
+        if briefs:
+            st.divider()
+            st.caption(f"**历史简报** ({len(briefs)} 份)")
+            for bf in briefs[:5]:
+                st.caption(f"📄 {bf}")
+
+
 # ═══════════════════════════════════════════════════════════════════
 # 品种偏见总览
 # ═══════════════════════════════════════════════════════════════════
@@ -1905,7 +2141,15 @@ def main():
     with st.expander("🌡 全品种结构热力图", expanded=False):
         render_structure_heatmap()
 
-    # ── 第四行：席位偏见总览（可折叠） ──
+    # ── 第四行：板块联动分析 ──
+    with st.expander("🏭 板块联动分析", expanded=False):
+        render_sector_health()
+
+    # ── 第五行：板块联动分析 ──
+    with st.expander("📋 每日简报", expanded=False):
+        _render_daily_brief()
+
+    # ── 第六行：席位偏见总览（可折叠） ──
     with st.expander("📊 席位偏见总览（全部品种）", expanded=True):
         render_bias_overview()
 

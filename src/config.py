@@ -145,6 +145,38 @@ NEW_ENTRANT_LOOKBACK = 5           # days to track cumulative new entrants
 NEW_ENTRANT_TOP_N = 20             # how many top brokers to track for entry/exit
 DIVERGENCE_SHRINK_THRESHOLD = 0.05 # CR_diff shrinking >5% = balance shifting
 
+# ── P4: Sector & Score Tracking ──────────────────────────────────
+SECTOR_DEFINITIONS = {
+    "黑色系": {
+        "symbols": ["i", "rb", "j", "hc", "jm", "fg", "sa", "sm", "si"],
+        "description": "铁矿石→螺纹钢→热卷→焦煤焦炭→玻璃纯碱",
+    },
+    "油脂油料": {
+        "symbols": ["y", "p", "oi"],
+        "description": "豆油/棕榈油/菜籽油",
+    },
+    "农产品": {
+        "symbols": ["m", "rm", "a", "b", "c", "cs", "jd", "lh"],
+        "description": "豆粕→菜粕→大豆→玉米→鸡蛋→生猪",
+    },
+    "软商品": {
+        "symbols": ["sr", "cf", "ap", "ru", "nr", "sp", "ur"],
+        "description": "白糖/棉花/苹果/橡胶/纸浆/尿素",
+    },
+    "化工": {
+        "symbols": ["ma", "ta", "eg", "eb", "pp", "l", "v"],
+        "description": "甲醇→PTA→乙二醇→苯乙烯→聚丙烯→塑料→PVC",
+    },
+    "能源": {
+        "symbols": ["sc", "fu", "pg"],
+        "description": "原油→燃料油→液化气",
+    },
+}
+
+SECTOR_ALERT_THRESHOLD = 0.60       # >60% of sector non-healthy → sector alert
+SCORE_HISTORY_FILE = "structure_scores.jsonl"  # stored in BIAS_DATA_DIR
+BRIEF_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "data", "briefs")
+
 # ── UI Configuration ─────────────────────────────────────────────
 UI_REFRESH_INTERVAL_SECONDS = 3     # Streamlit rerun interval
 UI_DARK_THEME = True                # use plotly_dark + dark sidebar

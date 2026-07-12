@@ -25,7 +25,10 @@ Typical pipeline:
     broker_ts = calc_broker_momentum_timeseries(hist, top_n=5)
 """
 
+import json
 import logging
+import os
+from datetime import datetime, timedelta
 from typing import Optional
 
 import numpy as np
@@ -1773,3 +1776,334 @@ def compute_structure_alerts_for_all(
     sev_order = {"high": 0, "medium": 1}
     all_alerts.sort(key=lambda a: (sev_order.get(a.get("severity", "low"), 9), a["symbol"]))
     return all_alerts
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 16. P4 — Score History Tracking
+# ═══════════════════════════════════════════════════════════════════
+
+def save_daily_scores(scores: list[dict], output_dir: str = None) -> str:
+    """Append today's scores to a JSONL file. Returns the file path."""
+    import json
+    from src.config import BIAS_DATA_DIR, SCORE_HISTORY_FILE
+
+    if output_dir is None:
+        output_dir = BIAS_DATA_DIR
+
+    os.makedirs(output_dir, exist_ok=True)
+    filepath = os.path.join(output_dir, SCORE_HISTORY_FILE)
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    entry = {"date": today, "scores": scores}
+
+    with open(filepath, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+
+    logger.info(f"Scores saved → {filepath}")
+    return filepath
+
+
+def load_score_history(filepath: str = None) -> pd.DataFrame:
+    """Load score history from JSONL into a DataFrame."""
+    import json
+    from src.config import BIAS_DATA_DIR, SCORE_HISTORY_FILE
+
+    if filepath is None:
+        filepath = os.path.join(BIAS_DATA_DIR, SCORE_HISTORY_FILE)
+    if not os.path.exists(filepath):
+        return pd.DataFrame()
+
+    rows = []
+    with open(filepath, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+                for s in entry.get("scores", []):
+                    rows.append({
+                        "date": entry.get("date", ""),
+                        "symbol": s.get("symbol", ""),
+                        "score": s.get("score", 0),
+                        "status": s.get("status", ""),
+                    })
+            except (json.JSONDecodeError, KeyError):
+                continue
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    return df.sort_values(["symbol", "date"]).reset_index(drop=True)
+
+
+def compute_score_timeseries(
+    historical_by_symbol: dict,
+    broker_ts_by_symbol: dict = None,
+) -> pd.DataFrame:
+    """
+    Compute structure scores for EACH available day (not just latest).
+
+    Returns a DataFrame with columns: date, symbol, score, status.
+    """
+    if broker_ts_by_symbol is None:
+        broker_ts_by_symbol = {}
+
+    all_rows = []
+    for symbol, hist in historical_by_symbol.items():
+        if not hist or len(hist) < 2:
+            continue
+
+        dates = sorted(hist.keys())
+
+        # Compute for each day with at least 2 days of data
+        for i in range(2, len(dates) + 1):
+            window_dates = dates[:i]
+            window_hist = {d: hist[d] for d in window_dates}
+
+            try:
+                cr_df = calc_cr_timeseries(window_hist)
+                cr_df = calc_cr_trend(cr_df)
+                turnover_df = calc_turnover_ratio(window_hist)
+                entrants_df = detect_new_entrants(window_hist)
+                div_df = calc_divergence_index(cr_df)
+                stb = calc_rank_stability(cr_df)
+
+                # Broker-level data
+                bts = broker_ts_by_symbol.get(symbol, {})
+                if not bts:
+                    bts = calc_broker_momentum_timeseries(window_hist, top_n=5)
+                defs = detect_broker_defections(bts)
+                # Filter defections to within window
+                defs = [d for d in defs if d.get("date", "") in window_dates]
+            except Exception:
+                continue
+
+            score = calc_structure_score(
+                cr_trend_df=cr_df, turnover_df=turnover_df,
+                entrants_df=entrants_df, divergence_df=div_df,
+                defections=defs, stability_df=stb, symbol=symbol,
+            )
+
+            all_rows.append({
+                "date": window_dates[-1],
+                "symbol": symbol,
+                "score": score["score"],
+                "status": score["status"],
+            })
+
+    if not all_rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(all_rows)
+    df["date"] = pd.to_datetime(df["date"], format="%Y%m%d", errors="coerce")
+    return df.sort_values(["symbol", "date"]).reset_index(drop=True)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 17. P4 — Sector Linkage Detection
+# ═══════════════════════════════════════════════════════════════════
+
+def calc_sector_health(
+    scores: list[dict],
+) -> dict[str, dict]:
+    """
+    Compute per-sector health metrics from a list of structure scores.
+
+    Parameters
+    ----------
+    scores : list[dict]
+        List of calc_structure_score() results.
+
+    Returns
+    -------
+    dict
+        {sector_name: {total, healthy, caution, unstable, critical,
+                       health_ratio, avg_score, alert, symbols_detail}}
+    """
+    from src.config import SECTOR_DEFINITIONS, SECTOR_ALERT_THRESHOLD
+
+    score_map = {s["symbol"]: s for s in scores}
+
+    results = {}
+    for sector_name, sector_info in SECTOR_DEFINITIONS.items():
+        sector_symbols = sector_info["symbols"]
+        present = [sym for sym in sector_symbols if sym in score_map]
+
+        if not present:
+            continue
+
+        total = len(present)
+        healthy = sum(1 for s in present if score_map[s]["status"] == "healthy")
+        caution = sum(1 for s in present if score_map[s]["status"] == "caution")
+        unstable = sum(1 for s in present if score_map[s]["status"] == "unstable")
+        critical = sum(1 for s in present if score_map[s]["status"] == "critical")
+        non_healthy = total - healthy
+        non_healthy_ratio = non_healthy / total if total > 0 else 0
+        avg_score = sum(score_map[s]["score"] for s in present) / total
+
+        # Alert if >60% of sector is non-healthy
+        alert = non_healthy_ratio >= SECTOR_ALERT_THRESHOLD
+
+        results[sector_name] = {
+            "total": total,
+            "healthy": healthy,
+            "caution": caution,
+            "unstable": unstable,
+            "critical": critical,
+            "non_healthy_ratio": round(non_healthy_ratio, 3),
+            "avg_score": round(avg_score, 1),
+            "alert": alert,
+            "description": sector_info["description"],
+            "symbols_detail": [
+                {
+                    "symbol": s,
+                    "score": score_map[s]["score"],
+                    "status": score_map[s]["status"],
+                    "summary": score_map[s].get("summary", ""),
+                }
+                for s in present
+            ],
+        }
+
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 18. P4 — Daily Structure Brief Generator
+# ═══════════════════════════════════════════════════════════════════
+
+def generate_daily_brief(
+    scores: list[dict],
+    sector_health: dict,
+    defections_by_symbol: dict = None,
+    alerts: list[dict] = None,
+    output_dir: str = None,
+) -> str:
+    """
+    Generate a daily structure brief in Markdown format.
+
+    Returns the Markdown text and optionally saves to file.
+    """
+    from src.config import BRIEF_OUTPUT_DIR, SYMBOL_NAMES, SECTOR_DEFINITIONS
+
+    if output_dir is None:
+        output_dir = BRIEF_OUTPUT_DIR
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    lines = []
+
+    lines.append(f"# 商品结构日报 — {today}")
+    lines.append("")
+    lines.append(f"> 自动生成 | 覆盖 {len(scores)} 个品种 | 6 个板块")
+    lines.append("")
+
+    # ═══ 1. Critical / Unstable symbols ═══
+    critical = [s for s in scores if s["status"] == "critical"]
+    unstable = [s for s in scores if s["status"] == "unstable"]
+
+    lines.append("## ⚠ 预警品种")
+    lines.append("")
+
+    if critical:
+        lines.append("### 🔴 危险（结构评分 < 40）")
+        lines.append("")
+        lines.append("| 品种 | 评分 | 摘要 |")
+        lines.append("|------|------|------|")
+        for s in critical:
+            name = SYMBOL_NAMES.get(s["symbol"], "")
+            lines.append(f"| {s['symbol']} {name} | {s['score']}/100 | {s.get('summary', '')} |")
+        lines.append("")
+
+    if unstable:
+        lines.append("### 🟠 松动（结构评分 < 60）")
+        lines.append("")
+        lines.append("| 品种 | 评分 | 摘要 |")
+        lines.append("|------|------|------|")
+        for s in unstable:
+            name = SYMBOL_NAMES.get(s["symbol"], "")
+            lines.append(f"| {s['symbol']} {name} | {s['score']}/100 | {s.get('summary', '')} |")
+        lines.append("")
+
+    if not critical and not unstable:
+        lines.append("✅ 无预警品种，所有品种结构评分 ≥ 60。")
+        lines.append("")
+
+    # ═══ 2. Improving / Declining ═══
+    lines.append("## 📈 变化追踪")
+    lines.append("")
+    lines.append("（连续运行后，此处显示评分升降幅度最大的品种）")
+    lines.append("")
+
+    # ═══ 3. Sector overview ═══
+    lines.append("## 🏭 板块总览")
+    lines.append("")
+    lines.append("| 板块 | 品种数 | 健康 | 关注 | 松动 | 危险 | 健康率 | 均分 | 预警 |")
+    lines.append("|------|--------|------|------|------|------|--------|------|------|")
+    for sname, sinfo in sorted(sector_health.items(),
+                                key=lambda x: x[1]["non_healthy_ratio"], reverse=True):
+        alert_tag = "⚠" if sinfo["alert"] else "✓"
+        lines.append(
+            f"| {sname} | {sinfo['total']} | {sinfo['healthy']} | {sinfo['caution']} | "
+            f"{sinfo['unstable']} | {sinfo['critical']} | "
+            f"{1 - sinfo['non_healthy_ratio']:.0%} | {sinfo['avg_score']:.0f} | {alert_tag} |"
+        )
+    lines.append("")
+
+    # ═══ 4. Sector details ═══
+    for sname, sinfo in sorted(sector_health.items(),
+                                key=lambda x: x[1]["non_healthy_ratio"], reverse=True):
+        if sinfo["non_healthy_ratio"] > 0:
+            lines.append(f"### {sname} — {sinfo['description']}")
+            lines.append("")
+            for sd in sinfo["symbols_detail"]:
+                emoji = {"healthy": "🟢", "caution": "🟡",
+                         "unstable": "🟠", "critical": "🔴"}.get(sd["status"], "?")
+                name = SYMBOL_NAMES.get(sd["symbol"], "")
+                lines.append(f"- {emoji} **{sd['symbol']}** {name} — {sd['score']}/100")
+            lines.append("")
+
+    # ═══ 5. Top defections ═══
+    if defections_by_symbol:
+        lines.append("## 🚨 今日重要叛变事件")
+        lines.append("")
+        all_defs = []
+        for sym, defs in defections_by_symbol.items():
+            # Only include recent (last day)
+            dates = sorted(set(d.get("date", "") for d in defs))
+            if dates:
+                latest_date = dates[-1]
+                recent = [d for d in defs if d.get("date") == latest_date
+                          and d.get("severity") == "high"]
+                all_defs.extend(recent)
+
+        if all_defs:
+            for d in all_defs[:10]:
+                lines.append(f"- **{d['broker']}** ({d.get('symbol', '')}): {d.get('detail', '')}")
+            lines.append("")
+        else:
+            lines.append("✅ 今日无高危叛变事件。")
+            lines.append("")
+
+    # ═══ 6. Smart money ═══
+    lines.append("## 💰 聪明钱提示")
+    lines.append("")
+    lines.append("（在 Dashboard 中查看完整的席位-价格相关性排名）")
+    lines.append("")
+
+    # ═══ Footer ═══
+    lines.append("---")
+    lines.append(f"*报告由 Commodity Structure Radar 自动生成 | {today}*")
+
+    brief_text = "\n".join(lines)
+
+    # Save to file
+    os.makedirs(output_dir, exist_ok=True)
+    filepath = os.path.join(output_dir, f"{today.replace('-', '')}.md")
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(brief_text)
+    logger.info(f"Daily brief saved → {filepath}")
+
+    return brief_text
